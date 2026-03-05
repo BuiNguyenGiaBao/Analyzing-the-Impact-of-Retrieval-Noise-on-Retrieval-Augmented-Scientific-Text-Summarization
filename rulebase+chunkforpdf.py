@@ -89,7 +89,6 @@ def clean_heading(line: str) -> str:
     return line.title() if line.isupper() else line
 
 def split_sentences(text: str) -> List[str]:
-    """Sentence splitting with NLTK fallback."""
     if not text or not text.strip():
         return []
     try:
@@ -265,7 +264,7 @@ def process_document(
     sections = rule_based_section_parse(text)
     chunks = chunk_sections(sections, max_words=max_words, overlap_words=overlap_words)
     return {
-        "chunking": "sentence-aware word/char budget (Option A)",
+        "chunking": "sentence-aware word/char budget ",
         "sections": sections,
         "chunks": chunks,
         "num_sections": len(sections),
