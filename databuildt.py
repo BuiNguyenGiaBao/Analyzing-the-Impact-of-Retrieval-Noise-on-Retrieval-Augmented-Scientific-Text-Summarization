@@ -1,11 +1,9 @@
-
 import os
 import json
 import random
 import argparse
 import time
 import numpy as np
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,7 +11,7 @@ import faiss
 from datasets import load_from_disk
 
 from rulebase_chunkforpdf import process_document
-from retrieval_tokenizer import DenseEncoder, MMRDenseRetriever, Document
+from retrieval_tokenizer import DenseEncoder, Document
 from summarized import T5Summarizer
 
 from tqdm import tqdm
@@ -662,7 +660,8 @@ def _assemble_one_paper(
                 "num_documents_in_context": unique_docs,
             })
             records.append(noisy_ex)
-
+        else:
+            print(f"[WARN] no noise for {pid} ({noise_mode})")
     return records
 
 # ---------------------------------------------------------------------------
@@ -1230,6 +1229,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     train_c = sum(1 for r in train_records if r["sample_type"] == "clean")
     train_n = sum(1 for r in train_records if r["sample_type"] == "noisy")
+    train_noisy_rate = 100 * train_n / max(train_c, 1)
 
     def pair_rate(noisy, clean):
         pct = 100 * len(noisy) / max(len(clean), 1)
@@ -1241,6 +1241,7 @@ def main() -> None:
     print(f"  train clean      : {train_c:>7,}  ->  {paths['train']}")
     print(f"  train noisy      : {train_n:>7,}      mode={args.train_noise_mode}")
     print(f"  train noisy prob : {args.train_noisy_prob}")
+    print(f"  train noisy rate : {train_n}/{train_c} ({train_noisy_rate:.1f}%)")
     print(f"  valid            : {len(valid_records):>7,}  ->  {paths['valid']}")
     print(f"  test clean       : {len(test_clean):>7,}  ->  {paths['test_clean']}")
     print(f"  test noisy easy  : {len(test_noisy_easy):>7,}  ->  {paths['test_noisy_easy']}")

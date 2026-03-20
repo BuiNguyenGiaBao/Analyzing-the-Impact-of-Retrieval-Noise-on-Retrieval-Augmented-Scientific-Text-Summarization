@@ -11,10 +11,9 @@ class ChunkConfig:
 
     MIN_SECTION_WORDS    = 10    # drop sections shorter than this
 
-    MAX_CHUNK_WORDS      = 150   # ↓ từ 220 → tạo ~1.5x chunks/paper
-    OVERLAP_WORDS        = 30    # ↓ từ 40
-    MIN_CHUNK_WORDS      = 40    # ↓ từ 60
-
+    MAX_CHUNK_WORDS      = 150   
+    OVERLAP_WORDS        = 30    
+    MIN_CHUNK_WORDS      = 40   
 
 COMMON_SECTIONS = {
     "abstract", "introduction", "background", "related work",
@@ -243,7 +242,6 @@ def process_document(text: str, source_doc_id: Optional[str] = None) -> Dict:
 
     sections = rule_based_section_parse(text)
 
-    # fallback nếu parser không tìm được section
     if len(sections) == 0:
         sections = [("Body", text)]
 
