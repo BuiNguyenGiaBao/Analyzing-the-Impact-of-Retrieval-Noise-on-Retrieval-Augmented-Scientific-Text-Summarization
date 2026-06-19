@@ -1,0 +1,17 @@
+metric,n_pairs,mean_diff,ci95_low,ci95_high,paired_ttest_p,analysis,model_label,train_setting,comparison,interpretation
+rouge1,1999,0.020853839833220193,0.017774789452801948,0.024032601075099257,1.2904180936371822e-39,degradation,t5_base,clean_trained,clean_minus_easy,positive means performance drops under noise
+rouge2,1999,0.011608983309872221,0.009804117823352701,0.013258522123563887,1.1753763489322969e-39,degradation,t5_base,clean_trained,clean_minus_easy,positive means performance drops under noise
+rougeL,1999,0.00990426974039103,0.008132647440766916,0.01172460612506347,1.5347376186644541e-27,degradation,t5_base,clean_trained,clean_minus_easy,positive means performance drops under noise
+bertscore_f1,1999,0.004667669967033077,0.004124744557004502,0.005248310646156838,6.9528751130371765e-59,degradation,t5_base,clean_trained,clean_minus_easy,positive means performance drops under noise
+rouge1,1999,0.024191773972830212,0.021111967830536003,0.027234152703269426,5.4409409249717346e-49,degradation,t5_base,clean_trained,clean_minus_hard,positive means performance drops under noise
+rouge2,1999,0.012762475465938408,0.01107816683037062,0.014577950468906841,2.3553693014510385e-43,degradation,t5_base,clean_trained,clean_minus_hard,positive means performance drops under noise
+rougeL,1999,0.011540170436191119,0.009793050757005517,0.01337089456795982,8.915069288710444e-34,degradation,t5_base,clean_trained,clean_minus_hard,positive means performance drops under noise
+bertscore_f1,1999,0.004866179882019028,0.004311625686301297,0.005405907354514679,2.476318076693672e-62,degradation,t5_base,clean_trained,clean_minus_hard,positive means performance drops under noise
+rouge1,1999,0.02264625069758863,0.01938797954074429,0.025658664449327885,2.3485579345030446e-47,degradation,t5_base,noise_aware,clean_minus_easy,positive means performance drops under noise
+rouge2,1999,0.013764784364662191,0.012018483735020303,0.015479009156763911,2.28373459593053e-54,degradation,t5_base,noise_aware,clean_minus_easy,positive means performance drops under noise
+rougeL,1999,0.010659108472178462,0.008966059622389541,0.012282113402011225,2.135941919714366e-36,degradation,t5_base,noise_aware,clean_minus_easy,positive means performance drops under noise
+bertscore_f1,1999,0.004539938912861582,0.003959218438355072,0.0051235857704331,4.1190815946981337e-57,degradation,t5_base,noise_aware,clean_minus_easy,positive means performance drops under noise
+rouge1,1999,0.023923944075542332,0.020984729962600132,0.026951248284248545,3.0704560810223043e-53,degradation,t5_base,noise_aware,clean_minus_hard,positive means performance drops under noise
+rouge2,1999,0.013104047887678315,0.011421296363713546,0.014864300492745366,7.586558194387327e-48,degradation,t5_base,noise_aware,clean_minus_hard,positive means performance drops under noise
+rougeL,1999,0.010745839102387623,0.009113405224132717,0.012471351279578081,7.558689341630387e-35,degradation,t5_base,noise_aware,clean_minus_hard,positive means performance drops under noise
+bertscore_f1,1999,0.004384652264658483,0.003841852531276863,0.004892634526975993,1.7583820150512116e-57,degradation,t5_base,noise_aware,clean_minus_hard,positive means performance drops under noise

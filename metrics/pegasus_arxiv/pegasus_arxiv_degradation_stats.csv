@@ -1,0 +1,17 @@
+metric,n_pairs,mean_diff,ci95_low,ci95_high,paired_ttest_p,analysis,model_label,train_setting,comparison,interpretation
+rouge1,1999,0.02936528648955284,0.02612829456862828,0.032703356241477556,1.642784368834465e-64,degradation,pegasus_arxiv,clean_trained,clean_minus_easy,positive means performance drops under noise
+rouge2,1999,0.019541692536848877,0.01765525142515865,0.021486883687621416,1.0231328878290476e-83,degradation,pegasus_arxiv,clean_trained,clean_minus_easy,positive means performance drops under noise
+rougeL,1999,0.014147329922459132,0.01238217084608133,0.016032560882695907,1.1961920481120733e-48,degradation,pegasus_arxiv,clean_trained,clean_minus_easy,positive means performance drops under noise
+bertscore_f1,1999,0.006142691023770781,0.005593393076623064,0.0067409547814552395,3.7919439722085467e-90,degradation,pegasus_arxiv,clean_trained,clean_minus_easy,positive means performance drops under noise
+rouge1,1999,0.04271452223677547,0.03939663405497233,0.04621294150778138,1.860512112185669e-115,degradation,pegasus_arxiv,clean_trained,clean_minus_hard,positive means performance drops under noise
+rouge2,1999,0.025098287257475375,0.02322030187403815,0.02713856958545313,4.7733980932082536e-117,degradation,pegasus_arxiv,clean_trained,clean_minus_hard,positive means performance drops under noise
+rougeL,1999,0.01997500620232661,0.018012764945432764,0.021984122841342848,1.2022682869274321e-83,degradation,pegasus_arxiv,clean_trained,clean_minus_hard,positive means performance drops under noise
+bertscore_f1,1999,0.008213897357289942,0.0076565215189854105,0.008765683215430167,3.0596276634364607e-141,degradation,pegasus_arxiv,clean_trained,clean_minus_hard,positive means performance drops under noise
+rouge1,1999,0.021769746792006443,0.01833683581099901,0.02490297827153896,2.535773027212051e-38,degradation,pegasus_arxiv,noise_aware,clean_minus_easy,positive means performance drops under noise
+rouge2,1999,0.012573990241240835,0.010804515796240328,0.014385231954852898,8.621531695998397e-41,degradation,pegasus_arxiv,noise_aware,clean_minus_easy,positive means performance drops under noise
+rougeL,1999,0.010463209250887215,0.00864940962687827,0.012207002940730892,9.39866246664327e-31,degradation,pegasus_arxiv,noise_aware,clean_minus_easy,positive means performance drops under noise
+bertscore_f1,1999,0.004131324473710702,0.0035756359269107324,0.004688297367173472,1.1307255921606963e-47,degradation,pegasus_arxiv,noise_aware,clean_minus_easy,positive means performance drops under noise
+rouge1,1999,0.023255049546402302,0.02010736857117039,0.026530941081836824,5.5705938915881806e-42,degradation,pegasus_arxiv,noise_aware,clean_minus_hard,positive means performance drops under noise
+rouge2,1999,0.012893714352975535,0.010955747270411525,0.014819466791376842,7.421843736421403e-40,degradation,pegasus_arxiv,noise_aware,clean_minus_hard,positive means performance drops under noise
+rougeL,1999,0.01167115020809526,0.009955323503918364,0.013429651866610477,4.868870751483416e-35,degradation,pegasus_arxiv,noise_aware,clean_minus_hard,positive means performance drops under noise
+bertscore_f1,1999,0.0043292846782258775,0.003780517155018492,0.0048897932214162065,1.557306505754847e-48,degradation,pegasus_arxiv,noise_aware,clean_minus_hard,positive means performance drops under noise
