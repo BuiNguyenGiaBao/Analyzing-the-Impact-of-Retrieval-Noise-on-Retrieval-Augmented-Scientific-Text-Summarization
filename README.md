@@ -1,392 +1,337 @@
-# Evaluating Noise-Aware Training for Robust RAG-Based Scientific Document Summarization under Controlled Retrieval Noise
-
-This repository contains the code, configuration files, and experimental outputs for the paper:
-
-**“Evaluating Noise-Aware Training for Robust RAG-Based Scientific Document Summarization under Controlled Retrieval Noise”**
-
-The project investigates how retrieval noise affects retrieval-augmented generation (RAG)-based scientific document summarization and whether noise-aware training can improve robustness under controlled noisy retrieval conditions.
+# Truncation-Aware Evaluation Protocol for Noise-Aware RAG Summarization
 
 ## Overview
 
-Retrieval-augmented generation is useful for summarizing long scientific documents because full papers often exceed the input length of standard encoder–decoder models. However, RAG performance depends strongly on retrieval quality. When the retrieved context contains irrelevant or source-incorrect chunks, the summarization model may receive distracting evidence and generate lower-quality summaries.
+This repository contains the experimental pipeline, dataset construction scripts, evaluation metrics, and manuscript files for a study on **truncation-aware robustness evaluation** in retrieval-augmented generation (RAG) summarization.
 
-This project evaluates summary-quality robustness under three retrieval conditions:
+The core contribution is not a new summarization model. Instead, this project proposes an **evaluation protocol** for deciding when a robustness claim under retrieval noise is reliable. In particular, the protocol checks whether apparent robustness is genuine or whether it may be inflated by input truncation, especially under additive-noise settings.
 
-1. **Clean retrieval**
-   The model receives only target-document chunks.
+## Vietnamese Summary
 
-2. **High-similarity noise**
-   The model receives the same clean target-document chunks plus cross-document noise chunks that are highly similar to the task-level summarization query.
+Kho lưu trữ này chứa mã nguồn, quy trình tạo dữ liệu, script đánh giá và bản thảo bài báo cho nghiên cứu về **giao thức đánh giá robustness có xét đến truncation** trong bài toán tóm tắt văn bản khoa học bằng RAG.
 
-3. **Low-similarity noise**
-   The model receives the same clean target-document chunks plus cross-document noise chunks that are distant from the task-level summarization query.
+Đóng góp chính của nghiên cứu không phải là một mô hình mới, mà là một **khung đánh giá** giúp xác định khi nào một tuyên bố “mô hình chống nhiễu tốt” là đáng tin cậy. Điểm quan trọng là tách bạch giữa:
 
-The study compares clean-trained and noise-aware variants of **T5-base**, **BART-base**, and **PEGASUS-arXiv**, with **LED-base** used as a clean-trained long-context baseline.
+- mô hình thật sự robust với nhiễu truy hồi;
+- mô hình có vẻ robust vì phần nhiễu đã bị cắt mất do giới hạn độ dài đầu vào.
 
-## Main Contributions
+## Research Motivation
 
-This repository supports three main contributions:
+RAG summarization systems can be affected by noisy retrieved context. However, robustness evaluation is often confounded by input length. When additive noise is appended to clean context, the input becomes longer and may exceed the model maximum source length. If noisy chunks are truncated before reaching the encoder, high robustness scores may be misleading.
 
-* A controlled query-conditioned retrieval-noise setting for evaluating RAG summarization robustness.
-* A context-construction strategy that keeps the number of clean target-document chunks fixed while adding source-incorrect noise chunks.
-* A comparative evaluation of noise-aware training across multiple summarization architectures.
+This project addresses that issue by introducing a truncation-aware evaluation protocol that combines:
+
+1. clean-context evaluation;
+2. additive-noise evaluation;
+3. substitutive-noise evaluation;
+4. retrieval diagnostics;
+5. model-specific truncation diagnostics;
+6. robustness degradation analysis;
+7. statistical testing;
+8. net utility analysis.
+
+## Main Contribution
+
+The main contribution is a **truncation-aware evaluation framework** for noise-aware RAG summarization.
+
+The framework evaluates whether robustness claims remain valid after checking:
+
+- whether retrieved distractors are actually present in the final context;
+- whether the input is heavily truncated;
+- whether additive-noise gains persist under substitutive noise;
+- whether performance gains are practically meaningful after accounting for clean-condition degradation;
+- whether results are supported by paired statistical tests.
 
 ## Experimental Design
 
-The experiment is based on a local Arrow-formatted article–abstract dataset derived from the Cornell-University arXiv dataset on Kaggle.
+### Models
 
-Each sample contains:
+The main experiments use:
 
-* `article`: source document used for chunking and retrieval
-* `abstract`: reference summary used for training and evaluation
+- `facebook/bart-base`
+- `google-t5/t5-base`
 
-The abstract is not used to construct the retrieval query or select retrieved chunks.
+Each architecture has two variants:
 
-### Context Construction
+- **clean-matched baseline**: trained on clean contexts;
+- **noise-aware model**: trained on clean and noisy contexts.
 
-The main context construction setting is:
+BART-base is used as the main case study because its truncation profile is more stable. T5-base is treated as a diagnostic baseline, especially because T5-base additive-noise inputs can suffer from high truncation.
 
-| Condition             | Target Chunks | Noise Chunks | Total Chunks | Target Ratio | Noise Ratio |
-| --------------------- | ------------: | -----------: | -----------: | -----------: | ----------: |
-| Clean                 |             3 |            0 |            3 |         1.00 |        0.00 |
-| High-similarity noise |             3 |            2 |            5 |         0.60 |        0.40 |
-| Low-similarity noise  |             3 |            2 |            5 |         0.60 |        0.40 |
+### Data Conditions
 
-The noisy conditions add cross-document distractor chunks without removing clean target-document evidence. This allows the evaluation to measure the effect of added retrieval noise rather than the effect of missing evidence.
+The evaluation uses five test conditions:
 
-## Method Pipeline
+| Condition | Description |
+|---|---|
+| `test_clean` | Clean retrieved context only |
+| `test_noisy_easy_additive` | Clean context plus easy distractor chunks |
+| `test_noisy_hard_additive` | Clean context plus hard distractor chunks |
+| `test_noisy_easy_substitutive` | Some clean chunks replaced by easy distractors |
+| `test_noisy_hard_substitutive` | Some clean chunks replaced by hard distractors |
 
-The experimental pipeline consists of the following stages:
+### Why Additive and Substitutive Noise?
 
-```text
-arXiv article–abstract dataset
-        |
-        v
-Document preprocessing
-        |
-        v
-Section-aware chunking
-        |
-        v
-Dense retrieval
-        |
-        v
-MMR reranking
-        |
-        v
-Controlled noise injection
-        |
-        v
-Input construction
-        |
-        v
-Model fine-tuning
-        |
-        v
-Evaluation under clean and noisy retrieval conditions
-```
+Additive noise tests robustness when distractors are appended to clean context. However, this can increase input length and cause truncation.
 
-## Models
+Substitutive noise replaces part of the clean context with distractors while keeping the number of chunks more comparable. This makes it a more reliable length-controlled diagnostic setting.
 
-The following models are evaluated:
+## Metrics
 
-| Model         | Training Setting              |
-| ------------- | ----------------------------- |
-| T5-base       | Clean-trained and noise-aware |
-| BART-base     | Clean-trained and noise-aware |
-| PEGASUS-arXiv | Clean-trained and noise-aware |
-| LED-base      | Clean-trained baseline only   |
+The evaluation package computes the following groups of metrics.
 
-## Training Configuration
+### Summarization Quality
 
-| Configuration        |     T5-base |   BART-base | PEGASUS-arXiv |    LED-base |
-| -------------------- | ----------: | ----------: | ------------: | ----------: |
-| Learning rate        |        3e-5 |        3e-5 |          2e-5 |        1e-5 |
-| Effective batch size |           8 |           8 |             8 |           8 |
-| Clean-trained epochs |           3 |           3 |             3 |           3 |
-| Noise-aware epochs   |           1 |           1 |             1 |           — |
-| Max input length     |        1024 |        1024 |          1024 |        2048 |
-| Max output length    |         256 |         256 |           256 |         192 |
-| Decoding strategy    | Beam search | Beam search |   Beam search | Beam search |
-| Beam size            |           2 |           2 |             2 |           2 |
-| Random seed          |          42 |          42 |            42 |          42 |
+- ROUGE-1
+- ROUGE-2
+- ROUGE-L
+- ROUGE-Lsum
+- BERTScore Precision / Recall / F1
 
-The clean-trained setting uses 20,000 clean training examples for 3 epochs.
-The noise-aware setting uses 60,000 mixed examples for 1 epoch.
-This keeps the number of training sample-passes comparable across settings.
+### Retrieval Diagnostics
 
-## Evaluation Metrics
+- Hit@K
+- Precision@K
+- Recall@K
+- MRR
+- nDCG@K
+- noise chunk ratio
 
-The models are evaluated using:
+Retrieval relevance is approximated by **source-document membership**. This proxy checks whether retrieved chunks come from the target paper, but it does not guarantee that each chunk contains summary-relevant evidence.
 
-* ROUGE-1
-* ROUGE-2
-* ROUGE-L
-* BERTScore F1
-* Absolute degradation
-* Relative degradation
-* Robustness gain
-* Paired bootstrap confidence intervals
-* Paired t-tests
+### Truncation Diagnostics
 
-The evaluation focuses on **summary-quality robustness**. It does not directly evaluate factual consistency or evidence faithfulness.
+- source token length
+- target token length
+- prediction token length
+- source truncation risk
+- target truncation risk
+- model-specific truncation rate
 
-## Main Results
+Model-specific truncation is important because BART and T5 use different tokenizers.
 
-### Overall Summarization Performance
+### Robustness Metrics
 
-| Model         | Training      | Condition |    R-1 |    R-2 |    R-L | BERT-F1 |
-| ------------- | ------------- | --------- | -----: | -----: | -----: | ------: |
-| T5-base       | Clean-trained | Clean     | 0.2587 | 0.0679 | 0.1678 |  0.8297 |
-| T5-base       | Clean-trained | High-sim. | 0.2379 | 0.0563 | 0.1579 |  0.8250 |
-| T5-base       | Clean-trained | Low-sim.  | 0.2345 | 0.0551 | 0.1563 |  0.8248 |
-| T5-base       | Noise-aware   | Clean     | 0.3134 | 0.0797 | 0.1877 |  0.8335 |
-| T5-base       | Noise-aware   | High-sim. | 0.2908 | 0.0660 | 0.1770 |  0.8289 |
-| T5-base       | Noise-aware   | Low-sim.  | 0.2895 | 0.0666 | 0.1769 |  0.8291 |
-| BART-base     | Clean-trained | Clean     | 0.3280 | 0.0871 | 0.1973 |  0.8429 |
-| BART-base     | Clean-trained | High-sim. | 0.3018 | 0.0722 | 0.1849 |  0.8379 |
-| BART-base     | Clean-trained | Low-sim.  | 0.2849 | 0.0658 | 0.1774 |  0.8358 |
-| BART-base     | Noise-aware   | Clean     | 0.3174 | 0.0844 | 0.1927 |  0.8418 |
-| BART-base     | Noise-aware   | High-sim. | 0.2969 | 0.0734 | 0.1840 |  0.8380 |
-| BART-base     | Noise-aware   | Low-sim.  | 0.2937 | 0.0730 | 0.1820 |  0.8379 |
-| PEGASUS-arXiv | Clean-trained | Clean     | 0.3531 | 0.0991 | 0.2065 |  0.8404 |
-| PEGASUS-arXiv | Clean-trained | High-sim. | 0.3237 | 0.0796 | 0.1924 |  0.8343 |
-| PEGASUS-arXiv | Clean-trained | Low-sim.  | 0.3104 | 0.0740 | 0.1865 |  0.8322 |
-| PEGASUS-arXiv | Noise-aware   | Clean     | 0.3488 | 0.0971 | 0.2056 |  0.8397 |
-| PEGASUS-arXiv | Noise-aware   | High-sim. | 0.3270 | 0.0845 | 0.1952 |  0.8355 |
-| PEGASUS-arXiv | Noise-aware   | Low-sim.  | 0.3255 | 0.0842 | 0.1939 |  0.8353 |
-| LED-base      | Clean-trained | Clean     | 0.3051 | 0.0819 | 0.1896 |  0.8415 |
-| LED-base      | Clean-trained | High-sim. | 0.2784 | 0.0659 | 0.1761 |  0.8355 |
-| LED-base      | Clean-trained | Low-sim.  | 0.2663 | 0.0622 | 0.1711 |  0.8341 |
+- retention rate
+- absolute degradation
+- relative degradation
+- additive vs. substitutive comparison
 
-### Paired Robustness Gain for BERTScore F1
+### Faithfulness Proxies
 
-| Model         | Condition |     ΔF1 | 95% CI             | p-value |
-| ------------- | --------- | ------: | ------------------ | ------: |
-| T5-base       | Clean     |  0.0038 | [0.0033, 0.0042]   |  < .001 |
-| T5-base       | High-sim. |  0.0039 | [0.0033, 0.0044]   |  < .001 |
-| T5-base       | Low-sim.  |  0.0042 | [0.0037, 0.0048]   |  < .001 |
-| BART-base     | Clean     | -0.0012 | [-0.0016, -0.0007] |  < .001 |
-| BART-base     | High-sim. |  0.0001 | [-0.0004, 0.0007]  |    .764 |
-| BART-base     | Low-sim.  |  0.0021 | [0.0015, 0.0027]   |  < .001 |
-| PEGASUS-arXiv | Clean     | -0.0007 | [-0.0012, -0.0003] |  < .001 |
-| PEGASUS-arXiv | High-sim. |  0.0013 | [0.0007, 0.0018]   |  < .001 |
-| PEGASUS-arXiv | Low-sim.  |  0.0031 | [0.0026, 0.0037]   |  < .001 |
+- source-supported entity rate
+- unsupported entity rate
+- number preservation
+- source token support rate
+- sentence support proxy
 
-## Key Findings
+These are treated as lightweight faithfulness proxies, not as full factual consistency metrics.
 
-The results show that retrieval noise reduces summarization performance across clean-trained models. Noise-aware training improves robustness in a model-dependent manner:
+### Statistical Tests
 
-* **T5-base** shows the most consistent gains across clean and noisy conditions.
-* **BART-base** mainly benefits under low-similarity noise and shows a clean-performance trade-off.
-* **PEGASUS-arXiv** shows a small clean-condition loss but gains robustness under noisy retrieval, especially under low-similarity noise.
-* **LED-base** serves as a useful long-context baseline, but it also declines under noisy retrieval conditions.
-
-Overall, the findings suggest that noise-aware training can improve summary-quality robustness under controlled retrieval noise, but its effect is not uniform across architectures and retrieval conditions.
-
-## Dataset
-
-The raw dataset source is:
-
-**Cornell-University arXiv Dataset**
-Kaggle: https://www.kaggle.com/datasets/Cornell-University/arxiv
-
-The full raw dataset is not redistributed in this repository. Users should download the dataset directly from Kaggle and reproduce the local Arrow and JSONL files using the provided scripts.
+- paired t-test
+- Wilcoxon signed-rank test
+- Cohen's dz
+- Cliff's delta
+- rank-biserial correlation
+- bootstrap 95% confidence interval
+- Holm-Bonferroni correction
 
 ## Repository Structure
 
-A suggested repository structure is shown below:
+A recommended repository structure is:
 
 ```text
 .
 ├── README.md
-├── configs/
-│   ├── t5_base.yaml
-│   ├── bart_base.yaml
-│   ├── pegasus_arxiv.yaml
-│   └── led_base.yaml
-├── data/
-│   └── README.md
-├── scripts/
-│   ├── build_arrow_dataset.py
-│   ├── chunk_articles.py
-│   ├── build_retrieval_index.py
-│   ├── build_noise_conditions.py
-│   ├── train_model.py
-│   └── evaluate_model.py
-├── results/
-│   ├── overall_results.csv
-│   ├── robustness_gain.csv
-│   └── metrics_by_condition.csv
 ├── paper/
-│   └── main_overleaf_free_github_link.tex
-└── requirements.txt
+│   ├── main_evaluation_framework_final.tex
+│   └── main_evaluation_framework_final.pdf
+├── data_builder/
+│   ├── databuildt_fixed_v2.py
+│   ├── retrieval_tokenizer.py
+│   ├── rulebase_chunkforpdf.py
+│   └── summarized.py
+├── training/
+│   ├── train_bart_t5_runpod_v2.py
+│   ├── run_train_bart_t5_auto_1epoch.sh
+│   └── requirements_train_runpod_v2.txt
+├── evaluation/
+│   ├── eval_rankB_metrics_runpod.py
+│   ├── run_rankB_metrics_full.sh
+│   ├── run_rankB_metrics_from_predictions.sh
+│   ├── run_rankB_metrics_rouge_only.sh
+│   └── requirements_rankB_metrics.txt
+├── outputs/
+│   ├── rankB_compact_paper_table.csv
+│   ├── rankB_metrics_summary.csv
+│   ├── rankB_robustness_degradation.csv
+│   ├── rankB_retrieval_summary.csv
+│   ├── rankB_truncation_summary.csv
+│   └── rankB_all_metrics_tables.xlsx
+└── prepared_data_rankB_fixed_v2/
+    ├── train_noiseaware.jsonl
+    ├── train_clean_matched.jsonl
+    ├── valid_noiseaware.jsonl
+    ├── valid_clean_matched.jsonl
+    ├── test_clean.jsonl
+    ├── test_noisy_easy_additive.jsonl
+    ├── test_noisy_hard_additive.jsonl
+    ├── test_noisy_easy_substitutive.jsonl
+    └── test_noisy_hard_substitutive.jsonl
 ```
 
-Adjust the filenames above if your local implementation uses different script names.
+Large datasets and model checkpoints should normally be excluded from Git and stored externally.
 
-## Installation
+## Environment
 
-Create a Python environment:
+The experiments were designed for a RunPod environment with an NVIDIA RTX 4090 24GB GPU.
+
+Recommended Python environment:
 
 ```bash
-python -m venv venv
-source venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements_train_runpod_v2.txt
+pip install -r requirements_rankB_metrics.txt
 ```
 
-Install dependencies:
+For BERTScore, PyTorch 2.6 or higher is recommended because recent Transformers versions restrict unsafe `torch.load` usage for older PyTorch versions.
+
+## Dataset Construction
+
+Example command:
 
 ```bash
-pip install -r requirements.txt
+python databuildt_fixed_v2.py   --arxiv_dir ./dataset/arxiv   --output_dir ./prepared_data_rankB_fixed_v2   --train_limit 20000   --valid_limit 1000   --test_limit 500   --min_target_words 30   --max_target_words 512   --final_k 3   --noise_k 2   --min_chunks 1   --noise_pool_limit 10000   --noise_pool_strategy heldout_train_tail   --test_noise_pool_offset 30000   --test_noise_pool_limit 10000   --substitutive_clean_k 1   --num_workers 2   --encode_batch_size 16   --paper_batch 100   --clean_control_mode unique   --seed 42   --laptop_safe
 ```
 
-A typical environment may include:
+The generated test files should contain:
 
 ```text
-torch
-transformers
-datasets
-sentence-transformers
-faiss-cpu
-numpy
-pandas
-scikit-learn
-rouge-score
-bert-score
-tqdm
+test_clean.jsonl
+test_noisy_easy_additive.jsonl
+test_noisy_hard_additive.jsonl
+test_noisy_easy_substitutive.jsonl
+test_noisy_hard_substitutive.jsonl
 ```
 
-If GPU acceleration is used, install the appropriate PyTorch version for your CUDA environment.
+Each test condition contains 500 samples in the full experiment.
 
-## Reproducibility Settings
+## Training
 
-Main experimental configuration:
+The training setup uses the same training budget for clean-matched and noise-aware variants.
+
+Example RunPod command:
+
+```bash
+cd /workspace
+
+DATA_DIR=/workspace/prepared_data_rankB_fixed_v2 OUT_ROOT=/workspace/outputs/bart_t5_auto_1epoch ./run_train_bart_t5_auto_1epoch.sh
+```
+
+Expected output directories:
 
 ```text
-final_k = 3
-noise_k = 2
-min_chunks = 3
-random_seed = 42
-clean_train_examples = 20000
-clean_validation_examples = 2000
-noise_aware_train_examples = 60000
-test_examples_per_condition = 1999
+/workspace/outputs/bart_t5_auto_1epoch/
+  01_bart_base_noiseaware/
+  02_bart_base_clean_matched/
+  03_t5_base_noiseaware/
+  04_t5_base_clean_matched/
 ```
 
-Noise construction:
+## Evaluation
+
+After training, run the full evaluation:
+
+```bash
+cd /workspace
+
+python eval_rankB_metrics_runpod.py   --data_dir /workspace/prepared_data_rankB_fixed_v2   --out_root /workspace/outputs/bart_t5_auto_1epoch   --output_dir /workspace/eval_outputs/rankB_metrics_full   --skip_generation   --max_source_length 1024   --max_target_length 512   --generation_max_length 320   --bertscore_batch_size 16   --bertscore_model roberta-large   --bertscore_max_length 512   --length_tokenizer facebook/bart-base
+```
+
+If BERTScore is too slow, run:
+
+```bash
+python eval_rankB_metrics_runpod.py   --data_dir /workspace/prepared_data_rankB_fixed_v2   --out_root /workspace/outputs/bart_t5_auto_1epoch   --output_dir /workspace/eval_outputs/rankB_metrics_rouge_only   --skip_generation   --skip_bertscore   --max_source_length 1024   --max_target_length 512   --generation_max_length 320   --length_tokenizer facebook/bart-base
+```
+
+## Main Output Files
+
+The evaluation script produces:
 
 ```text
-Clean condition:
-3 target-document chunks
-
-High-similarity noise condition:
-3 target-document chunks + 2 high-similarity cross-document noise chunks
-
-Low-similarity noise condition:
-3 target-document chunks + 2 low-similarity cross-document noise chunks
+rankB_metrics_record_level.csv
+rankB_metrics_summary.csv
+rankB_compact_paper_table.csv
+rankB_paired_noiseaware_vs_clean.csv
+rankB_robustness_degradation.csv
+rankB_additive_vs_substitutive.csv
+rankB_retrieval_summary.csv
+rankB_truncation_summary.csv
+rankB_all_metrics_tables.xlsx
 ```
 
-## Example Workflow
+Recommended files for reporting:
 
-### 1. Prepare the dataset
+| File | Purpose |
+|---|---|
+| `rankB_compact_paper_table.csv` | compact paper-level performance table |
+| `rankB_robustness_degradation.csv` | robustness retention/degradation |
+| `rankB_retrieval_summary.csv` | retrieval diagnostics |
+| `rankB_truncation_summary.csv` | truncation diagnostics |
+| `rankB_paired_noiseaware_vs_clean.csv` | statistical comparison |
+| `rankB_all_metrics_tables.xlsx` | complete workbook |
 
-```bash
-python scripts/build_arrow_dataset.py \
-  --input_path data/raw/arxiv \
-  --output_path data/processed/arxiv_arrow
-```
+## Key Findings
 
-### 2. Chunk articles
+The final paper frames the results as a case study of the proposed evaluation protocol.
 
-```bash
-python scripts/chunk_articles.py \
-  --input_path data/processed/arxiv_arrow \
-  --output_path data/chunks \
-  --chunk_size 150 \
-  --chunk_overlap 30 \
-  --min_chunk_words 40
-```
+Main findings:
 
-### 3. Build retrieval and noise conditions
+- BART-base noise-aware training shows modest robustness gains under hard additive noise.
+- Substitutive noise provides a more reliable length-controlled diagnostic than additive noise.
+- T5-base additive-noise results are not used as primary robustness evidence because of high truncation.
+- Small BERTScore gains should be interpreted conditionally and weighed against clean-condition degradation and training cost.
+- Truncation diagnostics are essential for deciding whether a robustness claim is reliable.
 
-```bash
-python scripts/build_noise_conditions.py \
-  --chunks_path data/chunks \
-  --output_path data/noise_conditions \
-  --final_k 3 \
-  --noise_k 2 \
-  --min_chunks 3 \
-  --seed 42
-```
+## Practical Interpretation
 
-### 4. Train models
+This project does not claim that noise-aware training universally improves RAG summarization. Instead, it argues that robustness claims should be accepted only when:
 
-```bash
-python scripts/train_model.py \
-  --config configs/t5_base.yaml \
-  --training_mode clean
-```
-
-```bash
-python scripts/train_model.py \
-  --config configs/t5_base.yaml \
-  --training_mode noise_aware
-```
-
-### 5. Evaluate models
-
-```bash
-python scripts/evaluate_model.py \
-  --model_path checkpoints/t5_base_noise_aware \
-  --test_path data/noise_conditions/test \
-  --output_path results/t5_base_noise_aware_results.csv
-```
-
-## Limitations
-
-This project evaluates summary-quality robustness using automatic metrics such as ROUGE and BERTScore. These metrics compare generated summaries with reference abstracts, but they do not directly verify whether each generated statement is supported by the retrieved evidence.
-
-Therefore, the results should be interpreted as evidence of **summary-quality robustness**, not as direct evidence of factual correctness or evidence faithfulness.
-
-Future work should evaluate:
-
-* factual consistency,
-* evidence support,
-* human evaluation,
-* split-specific test noise pools,
-* token-length and truncation effects,
-* length-controlled noise baselines,
-* alternative retrievers,
-* larger summarization models,
-* different noise ratios.
+1. retrieval noise is verified;
+2. truncation is controlled or reported;
+3. additive results are checked against substitutive results;
+4. performance gains survive statistical testing;
+5. practical utility is positive after accounting for clean-condition trade-offs.
 
 ## Citation
 
-If you use this repository, please cite the paper:
+If you use this repository, please cite the paper or repository as:
 
 ```bibtex
-@inproceedings{buinguyen2026noiseaware,
-  title     = {Evaluating Noise-Aware Training for Robust RAG-Based Scientific Document Summarization under Controlled Retrieval Noise},
-  author    = {Bui Nguyen Gia Bao},
-  year      = {2026},
-  booktitle = {Conference Workshop Paper},
-  note      = {Repository for controlled retrieval-noise evaluation in RAG-based scientific summarization}
+@misc{truncation_aware_rag_eval,
+  title        = {Truncation-Aware Evaluation Protocol for Noise-Aware RAG Summarization},
+  author       = {Your Name},
+  year         = {2026},
+  note         = {Evaluation framework and experimental pipeline for noise-aware RAG summarization}
 }
 ```
 
-Please update the venue name, page numbers, DOI, and publication details after acceptance.
+Please replace `Your Name` with the correct author information before public release.
 
-## Author
+## Limitations
 
-**Bui Nguyen Gia Bao**
-HUTECH University
-Ho Chi Minh City, Vietnam
-Email: [giabao.dl2005@gmail.com](mailto:giabao.dl2005@gmail.com)
+- Retrieval relevance is approximated by source-document membership rather than human relevance labels.
+- Faithfulness metrics are lightweight proxies and should not be interpreted as full factual consistency evaluation.
+- Results are based on BART-base and T5-base; larger long-context models may reduce truncation but require a different compute budget.
+- The study emphasizes evaluation validity rather than leaderboard-style performance optimization.
 
 ## License
 
-This repository is released for academic and research purposes. Please check the license file for details.
+- MIT License
+- Apache License 2.0
+- CC BY 4.0 for paper/materials
 
-## Acknowledgment
+## Contact
 
-This project uses publicly available scientific article–abstract data derived from the Cornell-University arXiv dataset on Kaggle and builds controlled retrieval-noise conditions for robust RAG-based scientific summarization evaluation.
+For questions, issues, or reproduction details, please open a GitHub issue or contact the repository maintainer.
