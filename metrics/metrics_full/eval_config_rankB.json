@@ -1,0 +1,64 @@
+{
+  "data_dir": "/workspace/prepared_data_rankB_fixed_v2",
+  "output_dir": "/workspace/eval_outputs/rankB_metrics_full",
+  "out_root": "/workspace/outputs/bart_t5_auto_1epoch",
+  "bart_noise_dir": null,
+  "bart_clean_dir": null,
+  "t5_noise_dir": null,
+  "t5_clean_dir": null,
+  "test_files": [
+    "test_clean.jsonl",
+    "test_noisy_easy_additive.jsonl",
+    "test_noisy_hard_additive.jsonl",
+    "test_noisy_easy_substitutive.jsonl",
+    "test_noisy_hard_substitutive.jsonl"
+  ],
+  "limit": null,
+  "max_source_length": 1024,
+  "max_target_length": 512,
+  "generation_max_length": 320,
+  "num_beams": 4,
+  "batch_size": 8,
+  "bertscore_model": "roberta-large",
+  "bertscore_batch_size": 8,
+  "bertscore_lang": "en",
+  "bertscore_rescale": false,
+  "bertscore_max_length": 512,
+  "skip_bertscore": false,
+  "length_tokenizer": "facebook/bart-base",
+  "retrieval_k_values": [
+    1,
+    3,
+    5,
+    10
+  ],
+  "skip_generation": true,
+  "overwrite_predictions": false,
+  "seed": 42,
+  "model_specs": [
+    {
+      "key": "bart_base_noiseaware",
+      "architecture": "BART-base",
+      "train_setting": "noiseaware",
+      "path": "/workspace/outputs/bart_t5_auto_1epoch/01_bart_base_noiseaware"
+    },
+    {
+      "key": "bart_base_clean_matched",
+      "architecture": "BART-base",
+      "train_setting": "clean_matched",
+      "path": "/workspace/outputs/bart_t5_auto_1epoch/02_bart_base_clean_matched"
+    },
+    {
+      "key": "t5_base_noiseaware",
+      "architecture": "T5-base",
+      "train_setting": "noiseaware",
+      "path": "/workspace/outputs/bart_t5_auto_1epoch/03_t5_base_noiseaware"
+    },
+    {
+      "key": "t5_base_clean_matched",
+      "architecture": "T5-base",
+      "train_setting": "clean_matched",
+      "path": "/workspace/outputs/bart_t5_auto_1epoch/04_t5_base_clean_matched"
+    }
+  ]
+}

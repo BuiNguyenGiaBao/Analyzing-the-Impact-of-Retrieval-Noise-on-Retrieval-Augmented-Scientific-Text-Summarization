@@ -7,7 +7,11 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
-import faiss
+try:
+    import faiss  # type: ignore
+except Exception:
+    faiss = None
+
 from datasets import load_from_disk
 
 from rulebase_chunkforpdf import process_document
@@ -40,6 +44,133 @@ FALLBACK_MAX_CHUNK_WORDS = 150
 FALLBACK_OVERLAP_WORDS = 30
 FALLBACK_MIN_CHUNK_WORDS = 40
 
+# Target/reference summary filter. This is important for BART/LED training:
+# arXiv abstracts should normally be short summaries. Extremely long targets
+# usually indicate that full article text leaked into target_text.
+DEFAULT_MIN_TARGET_WORDS = 20
+DEFAULT_MAX_TARGET_WORDS = 512
+
+# Hard cap each context chunk before writing input_text.
+# This prevents one bad section-aware chunk from creating 10k+ word inputs.
+MAX_CONTEXT_CHUNK_WORDS = 180
+
+
+def _word_count_simple(text: Any) -> int:
+    if text is None:
+        return 0
+    return len(str(text).replace("\n", " ").split())
+
+
+def filter_papers_by_target_length(
+    papers: List[Dict[str, str]],
+    split_name: str,
+    min_target_words: int = DEFAULT_MIN_TARGET_WORDS,
+    max_target_words: int = DEFAULT_MAX_TARGET_WORDS,
+) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    """Remove empty, too-short, and abnormally long abstract targets.
+
+    The same filter is applied before selecting train/validation/test targets and
+    before constructing held-out distractor pools. This keeps BART and LED
+    comparable because both models see the same cleaned JSONL rows.
+    """
+    kept: List[Dict[str, str]] = []
+    dropped_short = 0
+    dropped_long = 0
+    dropped_empty_article = 0
+    dropped_empty_target = 0
+    lengths_kept: List[int] = []
+    lengths_dropped: List[int] = []
+
+    for paper in papers:
+        article = str(paper.get("article", "")).strip()
+        abstract = str(paper.get("abstract", "")).strip()
+        tw = _word_count_simple(abstract)
+
+        if not article:
+            dropped_empty_article += 1
+            lengths_dropped.append(tw)
+            continue
+        if not abstract:
+            dropped_empty_target += 1
+            lengths_dropped.append(tw)
+            continue
+        if tw < int(min_target_words):
+            dropped_short += 1
+            lengths_dropped.append(tw)
+            continue
+        if tw > int(max_target_words):
+            dropped_long += 1
+            lengths_dropped.append(tw)
+            continue
+
+        kept.append(paper)
+        lengths_kept.append(tw)
+
+    def _stats(vals: List[int]) -> Dict[str, Any]:
+        if not vals:
+            return {"n": 0, "min": None, "mean": None, "max": None}
+        return {
+            "n": len(vals),
+            "min": int(min(vals)),
+            "mean": float(sum(vals) / len(vals)),
+            "max": int(max(vals)),
+        }
+
+    meta = {
+        "split": split_name,
+        "input_records": len(papers),
+        "kept_records": len(kept),
+        "dropped_records": len(papers) - len(kept),
+        "min_target_words": int(min_target_words),
+        "max_target_words": int(max_target_words),
+        "dropped_empty_article": int(dropped_empty_article),
+        "dropped_empty_target": int(dropped_empty_target),
+        "dropped_too_short": int(dropped_short),
+        "dropped_too_long": int(dropped_long),
+        "kept_target_word_stats": _stats(lengths_kept),
+        "dropped_target_word_stats": _stats(lengths_dropped),
+    }
+    return kept, meta
+
+
+def write_dataset_manifest(output_dir: str, manifest: Dict[str, Any]) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "dataset_build_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+
+def validate_jsonl_target_lengths(path: str) -> Dict[str, Any]:
+    """Quick post-write check for JSONL rows used by BART/LED training."""
+    n = 0
+    empty_input = 0
+    empty_target = 0
+    lens: List[int] = []
+    if not os.path.exists(path):
+        return {"path": path, "exists": False}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            inp = str(r.get("input_text", "")).strip()
+            tar = str(r.get("target_text", "")).strip()
+            n += 1
+            if not inp:
+                empty_input += 1
+            if not tar:
+                empty_target += 1
+            lens.append(_word_count_simple(tar))
+    return {
+        "path": path,
+        "exists": True,
+        "n": n,
+        "empty_input": empty_input,
+        "empty_target": empty_target,
+        "target_words_min": int(min(lens)) if lens else None,
+        "target_words_mean": float(sum(lens) / len(lens)) if lens else None,
+        "target_words_max": int(max(lens)) if lens else None,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Loaders
@@ -50,7 +181,7 @@ def _clean_field(x: Any, join_with: str = "\n") -> str:
         return ""
     if isinstance(x, list):
         return join_with.join(str(i).strip() for i in x if str(i).strip())
-    return str(x).replace("/n", "\n").strip()
+    return str(x).replace("\\n", "\n").replace("/n", "\n").strip()
 
 
 def load_pubmed_txt(path: str) -> List[Dict[str, str]]:
@@ -90,17 +221,38 @@ def load_arxiv_arrow(split_dir: str) -> List[Dict[str, str]]:
 # Document helpers
 # ---------------------------------------------------------------------------
 
+def _truncate_words(text: Any, max_words: int = MAX_CONTEXT_CHUNK_WORDS) -> str:
+    """Keep generated JSONL inputs bounded for models without safe truncation."""
+    words = str(text or "").replace("\n", " ").split()
+    if max_words is not None and max_words > 0 and len(words) > max_words:
+        return " ".join(words[:max_words])
+    return " ".join(words)
+
+
 def make_documents_from_chunks(chunks: List[Dict[str, Any]]) -> List[Document]:
-    return [
-        Document(
-            # BUG FIX: globally unique id = source_doc_id + chunk_id to avoid cross-paper collisions
-            id=f"{c.get('source_doc_id', 'unk')}_{c['chunk_id']}",
-            text=c["text"],
-            metadata=c,
+    documents: List[Document] = []
+    for c in chunks:
+        raw_text = c.get("text", "")
+        text = _truncate_words(raw_text, MAX_CONTEXT_CHUNK_WORDS)
+        if not text.strip():
+            continue
+
+        metadata = dict(c)
+        original_wc = _word_count_simple(raw_text)
+        metadata["original_word_count"] = int(original_wc)
+        metadata["word_count"] = int(_word_count_simple(text))
+        metadata["truncated_for_model"] = bool(original_wc > MAX_CONTEXT_CHUNK_WORDS)
+
+        documents.append(
+            Document(
+                # globally unique id = source_doc_id + chunk_id to avoid cross-paper collisions
+                id=f"{c.get('source_doc_id', 'unk')}_{c['chunk_id']}",
+                text=text,
+                metadata=metadata,
+            )
         )
-        for c in chunks
-        if c.get("text", "").strip()
-    ]
+    return documents
+
 def _get_source_doc_id(doc: Document) -> Optional[str]:
     if not hasattr(doc, "metadata") or doc.metadata is None:
         return None
@@ -263,6 +415,70 @@ def choose_query(paper_id: str, use_multiple: bool = True) -> str:
     if not use_multiple:
         return DEFAULT_QUERY_TEMPLATES[0]
     return random.Random(paper_id).choice(DEFAULT_QUERY_TEMPLATES)
+
+
+# ---------------------------------------------------------------------------
+# Lightweight example builder (no tokenizer/model dependency)
+# ---------------------------------------------------------------------------
+SAFE_MAX_CONTEXT_WORDS_EACH = 180
+SAFE_MAX_INPUT_WORDS = 950
+SAFE_MAX_TARGET_WORDS = 512
+
+
+def _truncate_words(text: Any, max_words: int) -> str:
+    """Whitespace word-level truncation for portable JSONL building.
+
+    The dataset builder should not depend on a seq2seq tokenizer/model. Actual
+    tokenization is done later by the training script for BART/PEGASUS/T5/LED/etc.
+    This function keeps the JSONL safe enough so downstream tokenizers are not
+    forced to handle extreme outliers.
+    """
+    clean = str(text or "").replace("\\n", " ").replace("/n", " ")
+    clean = " ".join(clean.split())
+    if not clean:
+        return ""
+    words = clean.split()
+    if len(words) > int(max_words):
+        words = words[: int(max_words)]
+    return " ".join(words).strip()
+
+
+def build_training_example_safe(
+    query: str,
+    contexts: List[str],
+    target_text: str,
+    max_contexts: Optional[int] = None,
+    task_prefix: str = "summarize",
+    max_context_words_each: int = SAFE_MAX_CONTEXT_WORDS_EACH,
+    max_input_words: int = SAFE_MAX_INPUT_WORDS,
+    max_target_words: int = SAFE_MAX_TARGET_WORDS,
+) -> Dict[str, str]:
+    """Build {input_text, target_text} without loading T5/BART/PEGASUS.
+
+    This fixes the zero-row failure caused when ``summarizer.build_training_example``
+    throws inside the assembly loop and the exception is swallowed. It also makes
+    the generated JSONL model-agnostic: BART, PEGASUS, T5, LED, and causal-LM
+    conversion scripts can tokenize later with their own limits.
+    """
+    q = _truncate_words(query, 80)
+    selected = list(contexts or [])
+    if max_contexts is not None:
+        selected = selected[: max(int(max_contexts), 0)]
+    clean_contexts = [
+        _truncate_words(c, max_context_words_each)
+        for c in selected
+        if _truncate_words(c, max_context_words_each)
+    ]
+    target = _truncate_words(target_text, max_target_words)
+    if not target:
+        raise ValueError("target_text is empty after cleaning/truncation")
+    if not clean_contexts:
+        raise ValueError("contexts are empty after cleaning/truncation")
+    source = f"{task_prefix}: question: {q} context: " + " ".join(clean_contexts)
+    source = _truncate_words(source, max_input_words)
+    if not source:
+        raise ValueError("input_text is empty after cleaning/truncation")
+    return {"input_text": source, "target_text": target}
 
 
 
@@ -504,9 +720,39 @@ def batch_encode_all_chunks(
 # Stage 3 helpers — per-paper retrieval using pre-built embeddings
 # ---------------------------------------------------------------------------
 
-def _build_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
-    dim   = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)
+class _NumpyIndexFlatIP:
+    """Small FAISS-compatible fallback for laptops where faiss-cpu is unavailable.
+
+    It is slower than FAISS but good enough for per-paper retrieval because each
+    paper only has a limited number of chunks.
+    """
+    def __init__(self, dim: int):
+        self.dim = dim
+        self.embeddings: Optional[np.ndarray] = None
+
+    def add(self, embeddings: np.ndarray) -> None:
+        self.embeddings = np.asarray(embeddings, dtype=np.float32)
+
+    def search(self, query_emb: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        if self.embeddings is None or len(self.embeddings) == 0:
+            return np.empty((1, 0), dtype=np.float32), np.empty((1, 0), dtype=np.int64)
+        q = np.asarray(query_emb, dtype=np.float32)
+        if q.ndim == 1:
+            q = q.reshape(1, -1)
+        scores = (self.embeddings @ q.T).squeeze()
+        scores = np.asarray(np.atleast_1d(scores), dtype=np.float32)
+        k = min(int(k), len(scores))
+        idxs = np.argsort(-scores)[:k].astype(np.int64)
+        return scores[idxs].reshape(1, -1), idxs.reshape(1, -1)
+
+
+def _build_faiss_index(embeddings: np.ndarray) -> Any:
+    dim = embeddings.shape[1]
+    if faiss is not None:
+        index = faiss.IndexFlatIP(dim)
+        index.add(embeddings)
+        return index
+    index = _NumpyIndexFlatIP(dim)
     index.add(embeddings)
     return index
 
@@ -542,7 +788,7 @@ def retrieve_clean(
     query_emb:   np.ndarray,
     documents:   List[Document],
     doc_embs:    np.ndarray,
-    index:       faiss.IndexFlatIP,
+    index:       Any,
     final_k:     int,
     noise_k:     int,
     mmr_lambda:  float = 0.5,
@@ -878,7 +1124,7 @@ def _assemble_one_paper(
         relevant_chunk_ids=relevant_chunk_ids,
     )
 
-    clean_ex = summarizer.build_training_example(
+    clean_ex = build_training_example_safe(
         query=query,
         contexts=clean_contexts,
         target_text=abstract,
@@ -926,7 +1172,7 @@ def _assemble_one_paper(
         )
 
         if bundle["has_true_noise"]:
-            noisy_ex = summarizer.build_training_example(
+            noisy_ex = build_training_example_safe(
                 query=query,
                 contexts=bundle["noisy_contexts"],
                 target_text=abstract,
@@ -1059,7 +1305,7 @@ def build_split_fast(
             records.extend(examples)
 
         except Exception as e:
-            print(f"[WARN] {split_name}::{pid}: {e}")
+            print(f"[WARN] {split_name}::{pid}: {type(e).__name__}: {e}")
 
         if (i + 1) % 500 == 0:
             print(f"  [{split_name}] {i+1}/{total} -> {len(records)} records")
@@ -1180,7 +1426,7 @@ def build_test_split_fast(
                 context_docs=retrieved_docs,
                 relevant_chunk_ids=relevant_chunk_ids,
             )
-            clean_ex = summarizer.build_training_example(
+            clean_ex = build_training_example_safe(
                 query=query,
                 contexts=clean_contexts,
                 target_text=abstract,
@@ -1217,7 +1463,7 @@ def build_test_split_fast(
                     noise_mode="cross_doc_easy",
                 )
                 if bundle_easy["has_true_noise"]:
-                    easy_ex = summarizer.build_training_example(
+                    easy_ex = build_training_example_safe(
                         query=query,
                         contexts=bundle_easy["noisy_contexts"],
                         target_text=abstract,
@@ -1263,7 +1509,7 @@ def build_test_split_fast(
                     noise_mode="cross_doc_hard",
                 )
                 if bundle_hard["has_true_noise"]:
-                    hard_ex = summarizer.build_training_example(
+                    hard_ex = build_training_example_safe(
                         query=query,
                         contexts=bundle_hard["noisy_contexts"],
                         target_text=abstract,
@@ -1295,7 +1541,7 @@ def build_test_split_fast(
                     hard_records.append(hard_ex)
 
         except Exception as e:
-            print(f"[WARN] {split_label}::{pid}: {e}")
+            print(f"[WARN] {split_label}::{pid}: {type(e).__name__}: {e}")
 
         if (i + 1) % 500 == 0:
             print(
@@ -1494,17 +1740,28 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Build conference-ready RAG summarization data from the full arXiv split. "
+            "This held-out version builds the distractor/noise pool from papers "
+            "that are not used as train/validation/test target examples. "
             "Train and validation are saved as clean+easy+hard mixed JSONL files; "
-            "test is saved as three separate clean/easy/hard files."
+            "the script also exports clean-matched training/validation JSONL files "
+            "with the same number of rows as the noise-aware files. "
+            "test is saved as clean, additive easy/hard, and substitutive easy/hard files."
         )
     )
     parser.add_argument("--source",      type=str, default="arxiv", choices=["arxiv"])
     parser.add_argument("--arxiv_dir",   type=str, default=ARXIV_DIR)
-    parser.add_argument("--output_dir",  type=str, default="./prepared_data_full_dataset_conference")
+    parser.add_argument("--output_dir",  type=str, default="./prepared_data_heldout_noise")
 
-    parser.add_argument("--train_limit", type=int, default=None)
-    parser.add_argument("--valid_limit", type=int, default=None)
-    parser.add_argument("--test_limit",  type=int, default=None)
+    parser.add_argument("--min_target_words", type=int, default=DEFAULT_MIN_TARGET_WORDS,
+                        help="Drop examples whose target/abstract has fewer words than this. Default 20.")
+    parser.add_argument("--max_target_words", type=int, default=DEFAULT_MAX_TARGET_WORDS,
+                        help="Drop examples whose target/abstract has more words than this. Default 512.")
+    parser.add_argument("--laptop_safe", action="store_true",
+                        help="Print laptop-safe guidance. Use smaller --encode_batch_size/--paper_batch/--num_workers on Windows laptops.")
+
+    parser.add_argument("--train_limit", type=int, default=20000, help="Number of target training papers. Default 20000 so the held-out noise pool can start at train[20000]. Use None only with an explicit --noise_pool_offset.")
+    parser.add_argument("--valid_limit", type=int, default=1000)
+    parser.add_argument("--test_limit",  type=int, default=500, help="Number of target TEST papers/examples. Default 500 so each test JSONL is capped to about 500 samples for laptop-friendly evaluation.")
 
     parser.add_argument("--final_k",  type=int, default=3)
     parser.add_argument("--noise_k",  type=int, default=2)
@@ -1517,8 +1774,106 @@ def parse_args() -> argparse.Namespace:
         help="Do not shuffle the combined train.jsonl records after merging clean/easy/hard."
     )
 
+    parser.add_argument(
+        "--clean_matched_copies",
+        type=int,
+        default=3,
+        help=(
+            "Only used when --clean_control_mode repeat. Number of clean copies per target paper "
+            "for the old repeated clean-control file."
+        ),
+    )
+    parser.add_argument(
+        "--clean_control_mode",
+        type=str,
+        default="unique",
+        choices=["unique", "repeat"],
+        help=(
+            "unique: train_clean_matched/valid_clean_matched are filled with different clean papers, "
+            "so paper_id is not repeated. repeat: old behavior, repeat the same clean rows to match the "
+            "noise-aware row count."
+        ),
+    )
+    parser.add_argument(
+        "--clean_extra_offset",
+        type=int,
+        default=None,
+        help=(
+            "Start index inside the filtered arXiv train split for extra unique clean-control papers. "
+            "If omitted, the script starts after train targets, train/valid noise pool, and test noise pool."
+        ),
+    )
+    parser.add_argument(
+        "--valid_clean_extra_offset",
+        type=int,
+        default=None,
+        help=(
+            "Start index inside the filtered validation split for extra unique validation clean-control papers. "
+            "If omitted, the script starts at valid_limit."
+        ),
+    )
+    parser.add_argument(
+        "--clean_extra_oversample_factor",
+        type=float,
+        default=1.35,
+        help=(
+            "When building unique clean-control rows, request extra papers by this factor because some papers "
+            "may be dropped by chunk filtering. Default 1.35."
+        ),
+    )
+
     # Pool large enough to supply both easy and hard noise candidates.
     parser.add_argument("--noise_pool_limit", type=int, default=10000)
+    parser.add_argument(
+        "--noise_pool_strategy",
+        type=str,
+        default="heldout_train_tail",
+        choices=["heldout_train_tail", "legacy_train_pool"],
+        help=(
+            "heldout_train_tail: use train papers after the target train_limit as the "
+            "distractor pool. This is the recommended setting for rank-B style validity. "
+            "legacy_train_pool: reproduce the old behavior by using the beginning of the "
+            "training split as the noise pool."
+        ),
+    )
+    parser.add_argument(
+        "--noise_pool_offset",
+        type=int,
+        default=None,
+        help=(
+            "Start index for the held-out noise pool inside the training split. "
+            "If omitted, the script uses train_limit as the offset. "
+            "Example: train_limit=20000 -> noise pool starts at train[20000]."
+        ),
+    )
+
+    parser.add_argument(
+        "--test_noise_pool_limit",
+        type=int,
+        default=10000,
+        help=(
+            "Number of held-out papers used only as the TEST distractor pool. "
+            "Default 10000. Recommended: train target [0:20000], train/valid noise [20000:30000], test noise [30000:40000]."
+        ),
+    )
+    parser.add_argument(
+        "--test_noise_pool_offset",
+        type=int,
+        default=30000,
+        help=(
+            "Start index for the independent test distractor pool inside the training split. "
+            "Default 30000 so it is disjoint from train target and train-noise pool."
+        ),
+    )
+    parser.add_argument(
+        "--substitutive_clean_k",
+        type=int,
+        default=1,
+        help=(
+            "Number of clean target-document chunks kept in substitutive-noise test. "
+            "Default 1 with noise_k=2 gives 1 clean + 2 noise = 3 chunks, matching clean context length in chunk count."
+        ),
+    )
 
     # By default, every train and validation paper creates three versions:
     # clean + easy-noise + hard-noise. If noise candidates cannot be found,
@@ -1561,11 +1916,224 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Performance
-    parser.add_argument("--num_workers",       type=int, default=4)
-    parser.add_argument("--encode_batch_size", type=int, default=64)
-    parser.add_argument("--paper_batch",       type=int, default=500)
+    parser.add_argument("--num_workers",       type=int, default=2)
+    parser.add_argument("--encode_batch_size", type=int, default=16)
+    parser.add_argument("--paper_batch",       type=int, default=100)
     parser.add_argument("--seed",              type=int, default=42)
     return parser.parse_args()
+
+
+def select_noise_pool_papers(
+    args: argparse.Namespace,
+    train_papers: List[Dict[str, str]],
+    valid_papers: List[Dict[str, str]],
+    test_papers: List[Dict[str, str]],
+) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    """Select papers for the distractor/noise pool.
+
+    Recommended strategy: ``heldout_train_tail``.
+
+    If the target training set is ``train_papers[:train_limit]``, the noise pool
+    is taken from ``train_papers[train_limit : train_limit + noise_pool_limit]``.
+    Therefore, the distractor documents are not used as target examples in
+    train/validation/test. Validation and test targets already come from separate
+    dataset splits.
+
+    This does not create a new model architecture. It only fixes the evaluation
+    design so that cross-document distractors come from a held-out document pool.
+    """
+    strategy = args.noise_pool_strategy
+
+    if strategy == "legacy_train_pool":
+        pool = train_papers[: args.noise_pool_limit]
+        meta = {
+            "noise_pool_strategy": "legacy_train_pool",
+            "description": (
+                "Legacy behavior: distractors are selected from the beginning of "
+                "the training split. This is not a held-out distractor pool."
+            ),
+            "train_target_range": [0, args.train_limit if args.train_limit is not None else len(train_papers)],
+            "validation_target_split": "validation",
+            "test_target_split": "test",
+            "noise_pool_range": [0, len(pool)],
+            "noise_pool_size_requested": args.noise_pool_limit,
+            "noise_pool_size_actual": len(pool),
+            "is_held_out_from_target_train_subset": False,
+        }
+        return pool, meta
+
+    if args.noise_pool_offset is not None:
+        start = int(args.noise_pool_offset)
+    else:
+        if args.train_limit is None:
+            raise ValueError(
+                "heldout_train_tail requires --train_limit or an explicit "
+                "--noise_pool_offset. In this fixed version the default is "
+                "--train_limit 20000. If you changed it to None, run with "
+                "--train_limit 20000 --noise_pool_limit 10000."
+            )
+        start = int(args.train_limit)
+
+    if start < 0:
+        raise ValueError("--noise_pool_offset must be >= 0")
+    if start >= len(train_papers):
+        raise ValueError(
+            f"Held-out noise pool offset {start} is outside the training split "
+            f"size ({len(train_papers)})."
+        )
+
+    end = min(start + int(args.noise_pool_limit), len(train_papers))
+    pool = train_papers[start:end]
+    if len(pool) == 0:
+        raise ValueError("Held-out noise pool is empty. Increase dataset size or reduce offset.")
+
+    train_target_end = args.train_limit if args.train_limit is not None else start
+    overlap_with_target_train = not (start >= int(train_target_end))
+    if overlap_with_target_train:
+        raise ValueError(
+            f"Held-out noise pool overlaps target train range: "
+            f"target=[0,{int(train_target_end)}), noise=[{start},{end}). "
+            "Use --noise_pool_offset >= --train_limit or --noise_pool_strategy legacy_train_pool."
+        )
+
+    meta = {
+        "noise_pool_strategy": "heldout_train_tail",
+        "description": (
+            "Distractors are selected from a held-out tail of the arXiv training split. "
+            "These documents are not used as target examples in the configured train, "
+            "validation, or test target sets."
+        ),
+        "train_target_range": [0, int(train_target_end)],
+        "validation_target_split": "validation",
+        "test_target_split": "test",
+        "noise_pool_range": [int(start), int(end)],
+        "noise_pool_size_requested": int(args.noise_pool_limit),
+        "noise_pool_size_actual": len(pool),
+        "is_held_out_from_target_train_subset": not overlap_with_target_train,
+        "important_note": (
+            "This is a held-out distractor document pool for retrieval-noise injection. "
+            "It is still drawn from the same arXiv dataset distribution, but not from "
+            "the configured target examples."
+        ),
+    }
+    return pool, meta
+
+
+def make_clean_matched_records(
+    clean_records: List[Dict[str, Any]],
+    copies: int = 3,
+    split_name: str = "train",
+    rng: Optional[random.Random] = None,
+    shuffle: bool = True,
+) -> List[Dict[str, Any]]:
+    """Create a clean-only control file with the same row count as noise-aware data.
+
+    Noise-aware training uses three variants per target paper: clean, high-similarity
+    noise, and low-similarity noise. If the clean model is trained with only one
+    clean row per paper, a reviewer can argue that any gain may come from seeing
+    more input variants/rows rather than from noise exposure itself.
+
+    This helper creates ``copies`` clean rows per target paper. With the default
+    ``copies=3``, the clean-control train file has approximately the same number
+    of rows as the noise-aware train file, while every row still uses clean context
+    only. This controls the training-sample-count comparison, but it does not
+    create new unique target papers.
+    """
+    copies = max(int(copies), 1)
+    matched: List[Dict[str, Any]] = []
+
+    for rec in clean_records:
+        for copy_id in range(copies):
+            item = dict(rec)
+            item["split"] = split_name
+            item["sample_type"] = "clean"
+            item["noise_mode"] = "clean"
+            item["noise_source"] = "none"
+            item["num_noise_chunks"] = 0
+            item["noise_chunk_ids"] = []
+            item["noise_source_doc_ids"] = []
+            item["clean_control_copy_id"] = copy_id
+            item["clean_control_num_copies"] = copies
+            item["train_setting"] = "clean_matched"
+            item["matched_to_noiseaware_rows"] = True
+            matched.append(item)
+
+    if shuffle and rng is not None:
+        rng.shuffle(matched)
+    return matched
+
+
+def make_unique_clean_matched_records(
+    primary_clean_records: List[Dict[str, Any]],
+    extra_clean_records: List[Dict[str, Any]],
+    desired_count: int,
+    split_name: str = "train",
+    rng: Optional[random.Random] = None,
+    shuffle: bool = True,
+) -> List[Dict[str, Any]]:
+    """Create a clean-control file without repeating the same paper_id.
+
+    This is the non-duplicated alternative to the old clean-matched control.
+    It first uses the clean records from the main target set, then fills the
+    remaining rows with extra clean-only papers from a disjoint tail of the
+    same raw split. The result can match the noise-aware row count while keeping
+    one clean row per paper_id.
+
+    Important: this removes exact duplicate clean inputs, but the clean-control
+    model now sees more unique target papers than the noise-aware model. Report
+    this as a clean-diversity control rather than a perfect paired control.
+    """
+    desired_count = int(desired_count)
+    matched: List[Dict[str, Any]] = []
+    seen_paper_ids = set()
+
+    def _add_records(records: List[Dict[str, Any]], source_label: str) -> None:
+        nonlocal matched
+        for rec in records:
+            if len(matched) >= desired_count:
+                break
+            pid = str(rec.get("paper_id", "")).strip()
+            if not pid or pid in seen_paper_ids:
+                continue
+            item = dict(rec)
+            item["split"] = split_name
+            item["sample_type"] = "clean"
+            item["noise_mode"] = "clean"
+            item["noise_source"] = "none"
+            item["num_noise_chunks"] = 0
+            item["noise_chunk_ids"] = []
+            item["noise_source_doc_ids"] = []
+            item["clean_control_copy_id"] = 0
+            item["clean_control_num_copies"] = 1
+            item["train_setting"] = "clean_matched_unique"
+            item["matched_to_noiseaware_rows"] = True
+            item["clean_control_mode"] = "unique_no_repeat"
+            item["clean_control_source"] = source_label
+            item["clean_control_uses_unique_paper_ids"] = True
+            matched.append(item)
+            seen_paper_ids.add(pid)
+
+    _add_records(primary_clean_records, "primary_target_clean")
+    _add_records(extra_clean_records, "extra_unique_clean")
+
+    if len(matched) < desired_count:
+        raise ValueError(
+            f"Not enough unique clean rows for {split_name}: "
+            f"needed {desired_count}, got {len(matched)}. "
+            f"Increase --clean_extra_oversample_factor or lower train/valid limits, "
+            f"or use --clean_control_mode repeat to reproduce the old duplicated control."
+        )
+
+    if shuffle and rng is not None:
+        rng.shuffle(matched)
+    return matched
+
+
+def _compute_unique_clean_request(needed: int, oversample_factor: float) -> int:
+    if needed <= 0:
+        return 0
+    return max(int(needed * max(float(oversample_factor), 1.0)) + 1000, needed)
+
 
 def main() -> None:
     args = parse_args()
@@ -1576,9 +2144,9 @@ def main() -> None:
     t_start = time.time()
 
     print("\nFull-dataset / conference-ready settings:")
-    print(f"  train_limit={args.train_limit}  (None = full train split)")
-    print(f"  valid_limit={args.valid_limit}  (None = full validation split)")
-    print(f"  test_limit ={args.test_limit}  (None = full test split)")
+    print(f"  train_limit={args.train_limit}  (default 20000 for held-out noise pool)")
+    print(f"  valid_limit={args.valid_limit}  (default 1000)")
+    print(f"  test_limit ={args.test_limit}  (default 500; test files are kept at 500 samples)")
     print(f"  min_chunks={args.min_chunks}")
     print(f"  noise_pool_limit={args.noise_pool_limit:,} papers")
 
@@ -1589,26 +2157,150 @@ def main() -> None:
     train_papers = load_arxiv_arrow(os.path.join(args.arxiv_dir, "train"))
     valid_papers = load_arxiv_arrow(os.path.join(args.arxiv_dir, "validation"))
     test_papers  = load_arxiv_arrow(os.path.join(args.arxiv_dir, "test"))
-    print(f"  train={len(train_papers):,}  valid={len(valid_papers):,}  "
+    print(f"  raw train={len(train_papers):,}  valid={len(valid_papers):,}  "
           f"test={len(test_papers):,}")
+
+    # ------------------------------------------------------------------
+    # Target/reference filter for BART + LED
+    # ------------------------------------------------------------------
+    train_papers, train_filter_meta = filter_papers_by_target_length(
+        train_papers, "train", args.min_target_words, args.max_target_words
+    )
+    valid_papers, valid_filter_meta = filter_papers_by_target_length(
+        valid_papers, "validation", args.min_target_words, args.max_target_words
+    )
+    test_papers, test_filter_meta = filter_papers_by_target_length(
+        test_papers, "test", args.min_target_words, args.max_target_words
+    )
+
+    target_filter_meta = {
+        "purpose": "Remove target_text/abstract outliers before building BART/LED JSONL data.",
+        "min_target_words": int(args.min_target_words),
+        "max_target_words": int(args.max_target_words),
+        "splits": {
+            "train": train_filter_meta,
+            "validation": valid_filter_meta,
+            "test": test_filter_meta,
+        },
+    }
+    print("\nTarget/reference filter for BART + LED:")
+    print(json.dumps(target_filter_meta, indent=2, ensure_ascii=False))
+
+    with open(os.path.join(args.output_dir, "target_filter_metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(target_filter_meta, f, indent=2, ensure_ascii=False)
+
+    print(f"  filtered train={len(train_papers):,}  valid={len(valid_papers):,}  "
+          f"test={len(test_papers):,}")
+
+    if args.laptop_safe:
+        print("\n[LAPTOP SAFE] Recommended: --encode_batch_size 16 --paper_batch 100 --num_workers 2")
+        if faiss is None:
+            print("[LAPTOP SAFE] faiss is not installed; using numpy search fallback.")
 
     # ------------------------------------------------------------------
     # Models
     # ------------------------------------------------------------------
     print("\nLoading encoder & summarizer...")
     encoder              = DenseEncoder(batch_size=args.encode_batch_size)
-    summarizer           = T5Summarizer()
+    summarizer           = None  # v2: JSONL build uses lightweight builder; no tokenizer/model load
     use_multiple_queries = not args.single_query
     shuffle_noisy        = not args.no_shuffle_noisy
 
     # ------------------------------------------------------------------
     # Build noise pool ONCE — shared by train, validation, and test.
+    # Recommended setting: held-out distractor pool.
     # ------------------------------------------------------------------
     print(f"\n  noise_pool_limit={args.noise_pool_limit}")
+    print(f"  noise_pool_strategy={args.noise_pool_strategy}")
+    noise_pool_papers, noise_pool_meta = select_noise_pool_papers(
+        args=args,
+        train_papers=train_papers,
+        valid_papers=valid_papers,
+        test_papers=test_papers,
+    )
+    print("  noise_pool_metadata:")
+    print(json.dumps(noise_pool_meta, indent=2, ensure_ascii=False))
+
+    # Save metadata early so the paper can report the exact held-out range.
+    noise_meta_path = os.path.join(args.output_dir, "noise_pool_metadata.json")
+    with open(noise_meta_path, "w", encoding="utf-8") as f:
+        json.dump(noise_pool_meta, f, indent=2, ensure_ascii=False)
+
     global_noise_pool, global_pool_embs = build_global_noise_pool(
-        papers=train_papers,
+        papers=noise_pool_papers,
         encoder=encoder,
-        limit=args.noise_pool_limit,
+        limit=None,
+        min_chunks=1,
+        num_workers=args.num_workers,
+        paper_batch=args.paper_batch,
+    )
+
+    # ------------------------------------------------------------------
+    # Build an independent TEST distractor pool.
+    # This pool is used only for final test additive/substitutive noisy
+    # evaluation. It is intentionally disjoint from the train target subset
+    # and, by default, also disjoint from the train/validation noise pool:
+    #   train targets       : train[0:20000]
+    #   train/valid noise   : train[20000:30000]
+    #   independent test noise: train[30000:40000]
+    # ------------------------------------------------------------------
+    test_start = int(args.test_noise_pool_offset)
+    if test_start < 0:
+        raise ValueError("--test_noise_pool_offset must be >= 0")
+    if test_start >= len(train_papers):
+        raise ValueError(
+            f"TEST noise pool offset {test_start} is outside the training split "
+            f"size ({len(train_papers)})."
+        )
+    test_end = min(test_start + int(args.test_noise_pool_limit), len(train_papers))
+    test_noise_pool_papers = train_papers[test_start:test_end]
+    if len(test_noise_pool_papers) == 0:
+        raise ValueError("TEST noise pool is empty. Reduce --test_noise_pool_offset or increase dataset size.")
+
+    train_target_end = int(args.train_limit) if args.train_limit is not None else 0
+    train_noise_range = noise_pool_meta.get("noise_pool_range", [None, None])
+    train_noise_start, train_noise_end = train_noise_range
+    disjoint_from_train_targets = test_start >= train_target_end
+    disjoint_from_train_noise = True
+    if train_noise_start is not None and train_noise_end is not None:
+        disjoint_from_train_noise = (test_end <= int(train_noise_start)) or (test_start >= int(train_noise_end))
+    if not disjoint_from_train_targets or not disjoint_from_train_noise:
+        raise ValueError(
+            f"TEST noise pool is not disjoint: test_noise=[{test_start},{test_end}), "
+            f"train_target=[0,{train_target_end}), train_valid_noise={train_noise_range}."
+        )
+
+    test_noise_meta = {
+        "noise_pool_role": "independent_test_distractor_pool",
+        "description": (
+            "Distractors for final test noisy conditions are selected from a separate "
+            "held-out tail of the arXiv training split. This pool is not used as target "
+            "training examples and is separate from the train/validation noise pool by default."
+        ),
+        "test_noise_pool_range": [int(test_start), int(test_end)],
+        "test_noise_pool_size_requested": int(args.test_noise_pool_limit),
+        "test_noise_pool_size_actual": len(test_noise_pool_papers),
+        "train_target_range": [0, train_target_end],
+        "train_valid_noise_pool_range": train_noise_range,
+        "is_disjoint_from_train_target_subset": bool(disjoint_from_train_targets),
+        "is_disjoint_from_train_valid_noise_pool": bool(disjoint_from_train_noise),
+        "substitutive_design": {
+            "clean_chunks_kept": int(args.substitutive_clean_k),
+            "noise_chunks_added": int(args.noise_k),
+            "purpose": "length-control ablation by keeping final context chunk count close to clean",
+        },
+    }
+    test_noise_meta_path = os.path.join(args.output_dir, "test_noise_pool_metadata.json")
+    with open(test_noise_meta_path, "w", encoding="utf-8") as f:
+        json.dump(test_noise_meta, f, indent=2, ensure_ascii=False)
+
+    print("\n  TEST noise_pool_metadata:")
+    print(json.dumps(test_noise_meta, indent=2, ensure_ascii=False))
+
+    test_global_noise_pool, test_global_pool_embs = build_global_noise_pool(
+        papers=test_noise_pool_papers,
+        encoder=encoder,
+        limit=None,
         min_chunks=1,
         num_workers=args.num_workers,
         paper_batch=args.paper_batch,
@@ -1642,6 +2334,103 @@ def main() -> None:
     if not args.no_shuffle_train_records:
         rng.shuffle(train_records)
 
+    # Clean-control train file with the same number of rows as the noise-aware file.
+    # Default mode is unique: no repeated paper_id in train_clean_matched.jsonl.
+    train_clean_extra_records: List[Dict[str, Any]] = []
+    train_clean_control_meta: Dict[str, Any] = {"mode": args.clean_control_mode}
+
+    if args.clean_control_mode == "repeat":
+        train_clean_matched = make_clean_matched_records(
+            clean_records=train_clean,
+            copies=args.clean_matched_copies,
+            split_name="train",
+            rng=rng,
+            shuffle=not args.no_shuffle_train_records,
+        )
+        train_clean_control_meta.update({
+            "policy": "repeat_same_clean_rows",
+            "clean_matched_copies": int(args.clean_matched_copies),
+            "unique_paper_ids": False,
+        })
+    else:
+        train_desired = len(train_records)
+        train_extra_needed = max(0, train_desired - len(train_clean))
+        # By default, keep extra clean-control papers disjoint from:
+        # train targets, train/valid noise pool, and independent test noise pool.
+        if args.clean_extra_offset is None:
+            noise_range = noise_pool_meta.get("noise_pool_range", [0, 0])
+            noise_end = int(noise_range[1] or 0)
+            clean_extra_start = max(
+                int(args.train_limit or 0),
+                noise_end,
+                int(test_end),
+            )
+        else:
+            clean_extra_start = int(args.clean_extra_offset)
+
+        if clean_extra_start >= len(train_papers):
+            raise ValueError(
+                f"clean_extra_offset={clean_extra_start} is outside filtered train size {len(train_papers)}"
+            )
+
+        train_extra_request = _compute_unique_clean_request(
+            train_extra_needed, args.clean_extra_oversample_factor
+        )
+        train_extra_papers = train_papers[clean_extra_start:]
+        train_extra_limit = min(len(train_extra_papers), train_extra_request)
+
+        print("\n── TRAIN CLEAN-MATCHED UNIQUE EXTRA CLEAN POOL ─────────────────────")
+        print(f"  clean_control_mode=unique")
+        print(f"  desired train_clean_matched rows={train_desired:,}")
+        print(f"  primary clean rows={len(train_clean):,}")
+        print(f"  extra unique clean rows needed={train_extra_needed:,}")
+        print(f"  extra clean train range starts at filtered train[{clean_extra_start}]")
+        print(f"  requesting extra clean papers={train_extra_limit:,}")
+
+        if train_extra_needed > 0:
+            train_clean_extra_records, _extra_easy, _extra_hard = build_test_split_fast(
+                papers=train_extra_papers,
+                encoder=encoder,
+                summarizer=summarizer,
+                limit=train_extra_limit,
+                final_k=args.final_k,
+                noise_k=0,
+                min_chunks=args.min_chunks,
+                use_multiple_queries=use_multiple_queries,
+                shuffle_noisy=shuffle_noisy,
+                global_noise_pool=None,
+                global_pool_embs=None,
+                rng=rng,
+                test_easy_prob=0.0,
+                test_hard_prob=0.0,
+                num_chunk_workers=args.num_workers,
+                paper_batch=args.paper_batch,
+                eval_split_name="train_clean_extra",
+            )
+
+        train_clean_matched = make_unique_clean_matched_records(
+            primary_clean_records=train_clean,
+            extra_clean_records=train_clean_extra_records,
+            desired_count=train_desired,
+            split_name="train",
+            rng=rng,
+            shuffle=not args.no_shuffle_train_records,
+        )
+        train_clean_control_meta.update({
+            "policy": "unique_no_repeat",
+            "desired_rows": int(train_desired),
+            "primary_clean_rows": int(len(train_clean)),
+            "extra_clean_rows_built": int(len(train_clean_extra_records)),
+            "extra_clean_rows_used": int(max(0, train_desired - len(train_clean))),
+            "clean_extra_offset_filtered_train": int(clean_extra_start),
+            "clean_extra_requested_papers": int(train_extra_limit),
+            "unique_paper_ids": True,
+            "note": (
+                "No exact clean row repetition is used. The clean-control set is row-count matched "
+                "by adding extra clean-only papers from a disjoint tail of the filtered train split."
+            ),
+        })
+
     # ------------------------------------------------------------------
     # VALIDATION split
     # Output requirement:
@@ -1669,14 +2458,91 @@ def main() -> None:
         eval_split_name="validation",
     )
     valid_records = valid_clean + valid_noisy_easy + valid_noisy_hard
+    valid_clean_extra_records: List[Dict[str, Any]] = []
+    valid_clean_control_meta: Dict[str, Any] = {"mode": args.clean_control_mode}
+
+    if args.clean_control_mode == "repeat":
+        valid_clean_matched = make_clean_matched_records(
+            clean_records=valid_clean,
+            copies=args.clean_matched_copies,
+            split_name="validation",
+            rng=rng,
+            shuffle=False,
+        )
+        valid_clean_control_meta.update({
+            "policy": "repeat_same_clean_rows",
+            "clean_matched_copies": int(args.clean_matched_copies),
+            "unique_paper_ids": False,
+        })
+    else:
+        valid_desired = len(valid_records)
+        valid_extra_needed = max(0, valid_desired - len(valid_clean))
+        valid_extra_start = int(args.valid_clean_extra_offset) if args.valid_clean_extra_offset is not None else int(args.valid_limit or 0)
+        if valid_extra_start >= len(valid_papers):
+            raise ValueError(
+                f"valid_clean_extra_offset={valid_extra_start} is outside filtered validation size {len(valid_papers)}"
+            )
+        valid_extra_request = _compute_unique_clean_request(
+            valid_extra_needed, args.clean_extra_oversample_factor
+        )
+        valid_extra_papers = valid_papers[valid_extra_start:]
+        valid_extra_limit = min(len(valid_extra_papers), valid_extra_request)
+
+        print("\n── VALID CLEAN-MATCHED UNIQUE EXTRA CLEAN POOL ─────────────────────")
+        print(f"  desired valid_clean_matched rows={valid_desired:,}")
+        print(f"  primary valid clean rows={len(valid_clean):,}")
+        print(f"  extra unique valid clean rows needed={valid_extra_needed:,}")
+        print(f"  extra validation range starts at filtered validation[{valid_extra_start}]")
+        print(f"  requesting extra validation clean papers={valid_extra_limit:,}")
+
+        if valid_extra_needed > 0:
+            valid_clean_extra_records, _valid_extra_easy, _valid_extra_hard = build_test_split_fast(
+                papers=valid_extra_papers,
+                encoder=encoder,
+                summarizer=summarizer,
+                limit=valid_extra_limit,
+                final_k=args.final_k,
+                noise_k=0,
+                min_chunks=args.min_chunks,
+                use_multiple_queries=use_multiple_queries,
+                shuffle_noisy=shuffle_noisy,
+                global_noise_pool=None,
+                global_pool_embs=None,
+                rng=rng,
+                test_easy_prob=0.0,
+                test_hard_prob=0.0,
+                num_chunk_workers=args.num_workers,
+                paper_batch=args.paper_batch,
+                eval_split_name="validation_clean_extra",
+            )
+
+        valid_clean_matched = make_unique_clean_matched_records(
+            primary_clean_records=valid_clean,
+            extra_clean_records=valid_clean_extra_records,
+            desired_count=valid_desired,
+            split_name="validation",
+            rng=rng,
+            shuffle=False,
+        )
+        valid_clean_control_meta.update({
+            "policy": "unique_no_repeat",
+            "desired_rows": int(valid_desired),
+            "primary_clean_rows": int(len(valid_clean)),
+            "extra_clean_rows_built": int(len(valid_clean_extra_records)),
+            "extra_clean_rows_used": int(max(0, valid_desired - len(valid_clean))),
+            "valid_clean_extra_offset_filtered_validation": int(valid_extra_start),
+            "valid_extra_requested_papers": int(valid_extra_limit),
+            "unique_paper_ids": True,
+        })
 
     # ------------------------------------------------------------------
-    # TEST split
-    # Output requirement:
-    #   test_clean.jsonl
-    #   test_noisy_easy.jsonl
-    #   test_noisy_hard.jsonl
-    # Test stays separated so the final report can compare clean/easy/hard.
+    # TEST split: additive noise and substitutive noise.
+    # Additive:      3 clean chunks + 2 noise chunks (old design)
+    # Substitutive:  1 clean chunk  + 2 noise chunks = 3 chunks total
+    # The substitutive set is the key length-control ablation: it keeps the
+    # final context chunk count close to clean and helps separate noise effects
+    # from the additive input-length confound.
+    # IMPORTANT: both final noisy test variants use the independent TEST pool.
     # ------------------------------------------------------------------
     test_clean, test_noisy_easy, test_noisy_hard = build_test_split_fast(
         papers=test_papers,
@@ -1688,8 +2554,8 @@ def main() -> None:
         min_chunks=args.min_chunks,
         use_multiple_queries=use_multiple_queries,
         shuffle_noisy=shuffle_noisy,
-        global_noise_pool=global_noise_pool,
-        global_pool_embs=global_pool_embs,
+        global_noise_pool=test_global_noise_pool,
+        global_pool_embs=test_global_pool_embs,
         rng=rng,
         test_easy_prob=args.test_easy_prob,
         test_hard_prob=args.test_hard_prob,
@@ -1698,21 +2564,101 @@ def main() -> None:
         eval_split_name="test",
     )
 
+    _test_clean_subst, test_substitutive_easy, test_substitutive_hard = build_test_split_fast(
+        papers=test_papers,
+        encoder=encoder,
+        summarizer=summarizer,
+        limit=args.test_limit,
+        final_k=args.substitutive_clean_k,
+        noise_k=args.noise_k,
+        min_chunks=args.min_chunks,
+        use_multiple_queries=use_multiple_queries,
+        shuffle_noisy=shuffle_noisy,
+        global_noise_pool=test_global_noise_pool,
+        global_pool_embs=test_global_pool_embs,
+        rng=rng,
+        test_easy_prob=args.test_easy_prob,
+        test_hard_prob=args.test_hard_prob,
+        num_chunk_workers=args.num_workers,
+        paper_batch=args.paper_batch,
+        eval_split_name="test",
+    )
+    # Mark substitutive mode explicitly for downstream tables.
+    for r in test_substitutive_easy:
+        r["noise_design"] = "substitutive"
+        r["noise_mode"] = "cross_doc_easy_substitutive"
+    for r in test_substitutive_hard:
+        r["noise_design"] = "substitutive"
+        r["noise_mode"] = "cross_doc_hard_substitutive"
+    for r in test_noisy_easy:
+        r["noise_design"] = "additive"
+    for r in test_noisy_hard:
+        r["noise_design"] = "additive"
+    for r in test_clean:
+        r["noise_design"] = "clean"
+
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
     paths = {
-        "train":           os.path.join(args.output_dir, "train.jsonl"),
-        "valid":           os.path.join(args.output_dir, "valid.jsonl"),
-        "test_clean":      os.path.join(args.output_dir, "test_clean.jsonl"),
-        "test_noisy_easy": os.path.join(args.output_dir, "test_noisy_easy.jsonl"),
-        "test_noisy_hard": os.path.join(args.output_dir, "test_noisy_hard.jsonl"),
+        # Backward-compatible names. Use train.jsonl for noise-aware training.
+        "train":               os.path.join(args.output_dir, "train.jsonl"),
+        "valid":               os.path.join(args.output_dir, "valid.jsonl"),
+        # Explicit names for cleaner experimental reporting.
+        "train_noiseaware":     os.path.join(args.output_dir, "train_noiseaware.jsonl"),
+        "train_clean_matched":  os.path.join(args.output_dir, "train_clean_matched.jsonl"),
+        "valid_noiseaware":     os.path.join(args.output_dir, "valid_noiseaware.jsonl"),
+        "valid_clean_matched":  os.path.join(args.output_dir, "valid_clean_matched.jsonl"),
+        "test_clean":          os.path.join(args.output_dir, "test_clean.jsonl"),
+        "test_noisy_easy":     os.path.join(args.output_dir, "test_noisy_easy.jsonl"),
+        "test_noisy_hard":     os.path.join(args.output_dir, "test_noisy_hard.jsonl"),
+        "test_noisy_easy_additive": os.path.join(args.output_dir, "test_noisy_easy_additive.jsonl"),
+        "test_noisy_hard_additive": os.path.join(args.output_dir, "test_noisy_hard_additive.jsonl"),
+        "test_noisy_easy_substitutive": os.path.join(args.output_dir, "test_noisy_easy_substitutive.jsonl"),
+        "test_noisy_hard_substitutive": os.path.join(args.output_dir, "test_noisy_hard_substitutive.jsonl"),
     }
-    write_jsonl(paths["train"],           train_records)
-    write_jsonl(paths["valid"],           valid_records)
-    write_jsonl(paths["test_clean"],      test_clean)
-    write_jsonl(paths["test_noisy_easy"], test_noisy_easy)
-    write_jsonl(paths["test_noisy_hard"], test_noisy_hard)
+    write_jsonl(paths["train"],               train_records)
+    write_jsonl(paths["valid"],               valid_records)
+    write_jsonl(paths["train_noiseaware"],    train_records)
+    write_jsonl(paths["train_clean_matched"], train_clean_matched)
+    write_jsonl(paths["valid_noiseaware"],    valid_records)
+    write_jsonl(paths["valid_clean_matched"], valid_clean_matched)
+    write_jsonl(paths["test_clean"],          test_clean)
+    # Backward-compatible additive filenames
+    write_jsonl(paths["test_noisy_easy"],     test_noisy_easy)
+    write_jsonl(paths["test_noisy_hard"],     test_noisy_hard)
+    # Explicit additive/substitutive filenames for rank-B ablation reporting
+    write_jsonl(paths["test_noisy_easy_additive"], test_noisy_easy)
+    write_jsonl(paths["test_noisy_hard_additive"], test_noisy_hard)
+    write_jsonl(paths["test_noisy_easy_substitutive"], test_substitutive_easy)
+    write_jsonl(paths["test_noisy_hard_substitutive"], test_substitutive_hard)
+
+    # Post-write validation so you can verify the data before BART/LED training.
+    post_write_checks = {
+        name: validate_jsonl_target_lengths(path)
+        for name, path in paths.items()
+    }
+    with open(os.path.join(args.output_dir, "post_write_target_length_checks.json"), "w", encoding="utf-8") as f:
+        json.dump(post_write_checks, f, indent=2, ensure_ascii=False)
+
+    build_manifest = {
+        "dataset_purpose": "BART-base and T5-base RAG summarization training/evaluation",
+        "model_ready_for": ["facebook/bart-base", "google-t5/t5-base"],
+        "source_dataset": "arXiv article/abstract loaded from disk",
+        "target_filter": target_filter_meta,
+        "jsonl_files": paths,
+        "clean_control_metadata": {
+            "train": train_clean_control_meta,
+            "validation": valid_clean_control_meta,
+        },
+        "post_write_target_length_checks": post_write_checks,
+        "retrieval_k_values": DEFAULT_RETRIEVAL_K_VALUES,
+        "final_k": int(args.final_k),
+        "noise_k": int(args.noise_k),
+        "substitutive_clean_k": int(args.substitutive_clean_k),
+        "seed": int(args.seed),
+    }
+    write_dataset_manifest(args.output_dir, build_manifest)
 
     # ------------------------------------------------------------------
     # Summary
@@ -1727,31 +2673,54 @@ def main() -> None:
     print(f"\n{'='*60}")
     print(f"  Done in {elapsed/60:.1f} min")
     print("  Output design:")
-    print("    train.jsonl = clean + easy + hard")
-    print("    valid.jsonl = clean + easy + hard")
-    print("    test split  = 3 separate files: clean / easy / hard")
+    print("    train.jsonl / train_noiseaware.jsonl = clean + easy + hard")
+    print("    train_clean_matched.jsonl = clean-only, row-count matched to noise-aware")
+    print(f"    clean_control_mode = {args.clean_control_mode}")
+    print("    valid.jsonl / valid_noiseaware.jsonl = clean + easy + hard")
+    print("    valid_clean_matched.jsonl = clean-only, row-count matched")
+    print("    test split  = clean + additive easy/hard + substitutive easy/hard")
+    print("-" * 60)
+    print(f"  target filter    : {args.min_target_words} <= target_words <= {args.max_target_words}")
+    print(f"  post-write check : {os.path.join(args.output_dir, 'post_write_target_length_checks.json')}")
+    print(f"  build manifest   : {os.path.join(args.output_dir, 'dataset_build_manifest.json')}")
     print("-" * 60)
     print(f"  train clean      : {len(train_clean):>7,}")
     print(f"  train noisy easy : {len(train_noisy_easy):>7,}  pair={pair_rate(train_noisy_easy, train_clean)}")
     print(f"  train noisy hard : {len(train_noisy_hard):>7,}  pair={pair_rate(train_noisy_hard, train_clean)}")
-    print(f"  train total      : {len(train_records):>7,}  ->  {paths['train']}")
+    print(f"  train total noise-aware : {len(train_records):>7,}  ->  {paths['train_noiseaware']}")
+    print(f"  train clean matched     : {len(train_clean_matched):>7,}  ->  {paths['train_clean_matched']}")
     print("-" * 60)
     print(f"  valid clean      : {len(valid_clean):>7,}")
     print(f"  valid noisy easy : {len(valid_noisy_easy):>7,}  pair={pair_rate(valid_noisy_easy, valid_clean)}")
     print(f"  valid noisy hard : {len(valid_noisy_hard):>7,}  pair={pair_rate(valid_noisy_hard, valid_clean)}")
-    print(f"  valid total      : {len(valid_records):>7,}  ->  {paths['valid']}")
+    print(f"  valid total noise-aware : {len(valid_records):>7,}  ->  {paths['valid_noiseaware']}")
+    print(f"  valid clean matched     : {len(valid_clean_matched):>7,}  ->  {paths['valid_clean_matched']}")
     print("-" * 60)
     print(f"  test clean       : {len(test_clean):>7,}  ->  {paths['test_clean']}")
     print(f"  test noisy easy  : {len(test_noisy_easy):>7,}  ->  {paths['test_noisy_easy']}")
     print(f"    pair rate easy : {pair_rate(test_noisy_easy, test_clean)}")
     print(f"  test noisy hard  : {len(test_noisy_hard):>7,}  ->  {paths['test_noisy_hard']}")
     print(f"    pair rate hard : {pair_rate(test_noisy_hard, test_clean)}")
+    print(f"  test subst easy  : {len(test_substitutive_easy):>7,}  ->  {paths['test_noisy_easy_substitutive']}")
+    print(f"    pair rate subst easy : {pair_rate(test_substitutive_easy, test_clean)}")
+    print(f"  test subst hard  : {len(test_substitutive_hard):>7,}  ->  {paths['test_noisy_hard_substitutive']}")
+    print(f"    pair rate subst hard : {pair_rate(test_substitutive_hard, test_clean)}")
     print("  noise strategy   : dynamic percentile with controlled relaxation")
     print("                     easy: p70-p95 -> fallback p60-p98")
     print("                     hard: bottom p10 -> fallback bottom p20")
+    if args.clean_control_mode == "repeat":
+        print(f"  clean matched copies per paper: {args.clean_matched_copies}")
+    else:
+        print("  clean matched mode : unique_no_repeat (no repeated paper_id)")
+        print(f"  train extra clean built: {train_clean_control_meta.get('extra_clean_rows_built', 0):,}")
+        print(f"  valid extra clean built: {valid_clean_control_meta.get('extra_clean_rows_built', 0):,}")
     print("  eval fields      : retrieved/context chunk ids + precision@K/recall@K")
     print(f"  eval K values    : {DEFAULT_RETRIEVAL_K_VALUES}")
-    print(f"  noise pool       : {len(global_noise_pool):,} chunks from {args.noise_pool_limit} papers")
+    print(f"  train/valid noise pool : {len(global_noise_pool):,} chunks from {len(noise_pool_papers):,} held-out papers")
+    print(f"  train/valid noise meta : {noise_meta_path}")
+    print(f"  TEST noise pool        : {len(test_global_noise_pool):,} chunks from {len(test_noise_pool_papers):,} held-out papers")
+    print(f"  TEST noise meta        : {test_noise_meta_path}")
+    print(f"  substitutive design    : {args.substitutive_clean_k} clean chunk(s) + {args.noise_k} noise chunk(s)")
     print(f"{'='*60}")
 
 

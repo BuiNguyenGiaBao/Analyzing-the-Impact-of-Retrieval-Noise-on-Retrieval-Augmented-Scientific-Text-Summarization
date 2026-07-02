@@ -1,5 +1,0 @@
-metric,n_pairs,mean_diff,ci95_low,ci95_high,paired_ttest_p,analysis,model_label,condition,comparison,interpretation
-rouge1,1999,0.05470345663583502,0.05186786887941604,0.05746055729522271,4.646921802469646e-245,clean_tradeoff,t5_base,clean,noise_aware_minus_clean_trained_on_clean_test,negative means noise training hurts clean performance
-rouge2,1999,0.01185436588573143,0.010206422441590998,0.013432065469713879,1.1731128172290332e-49,clean_tradeoff,t5_base,clean,noise_aware_minus_clean_trained_on_clean_test,negative means noise training hurts clean performance
-rougeL,1999,0.01984952904184073,0.01825071482536984,0.021451196056190232,9.089514520681721e-113,clean_tradeoff,t5_base,clean,noise_aware_minus_clean_trained_on_clean_test,negative means noise training hurts clean performance
-bertscore_f1,1999,0.0037609314012074244,0.003297365929795361,0.0042258777652399845,5.783283493957103e-55,clean_tradeoff,t5_base,clean,noise_aware_minus_clean_trained_on_clean_test,negative means noise training hurts clean performance
